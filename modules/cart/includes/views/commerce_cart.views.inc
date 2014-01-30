@@ -29,6 +29,14 @@ function commerce_cart_views_data_alter(&$data) {
       'handler' => 'commerce_cart_handler_area_empty_text',
     ),
   );
+
+  $data['commerce_line_item']['cart_line_item_link_edit'] = array(
+    'field' => array(
+      'title' => t('Cart Line Item Edit link'),
+      'help' => t('Link to the edit form for a cart line item.'),
+      'handler' => 'commerce_cart_handler_field_cart_line_item_link_edit',
+    ),
+  );
 }
 
 /**

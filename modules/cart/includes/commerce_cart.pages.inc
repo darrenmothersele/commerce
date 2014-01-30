@@ -51,3 +51,50 @@ function commerce_cart_view() {
 
   return $content;
 }
+
+/**
+ * Form callback wrapper: edit a cart line item.
+ *
+ * @param $line_item
+ *   The line item object to edit through the form.
+ * @param $show_quantity
+ *   Boolean indicating whether or not to show the quantity widget; defaults to
+ *   FALSE resulting in a hidden field holding the quantity.
+ * @param $context
+ *   Information on the context of the form's placement, allowing it to update
+ *   product fields on the page based on the currently selected default product.
+ *
+ * @see commerce_cart_add_to_cart_form()
+ */
+function commerce_cart_line_item_form_wrapper($line_item, $show_quantity = NULL, $context = array()) {
+  if (!isset($_GET['token']) || !drupal_valid_token($_GET['token'], 'commerce_line_item_edit:' . $line_item->line_item_id) || !commerce_cart_line_item_form_menu_item_access($line_item)) {
+    return MENU_ACCESS_DENIED;
+  }
+
+  // Resolve $show_quantity.
+  $show_quantity_default = FALSE;
+  if (isset($show_quantity)) {
+    // Set to function argument
+    $show_quantity = (bool) $show_quantity;
+  }
+  elseif (isset($_GET['show_quantity'])) {
+    // Safely resolve from query parameter
+    $show_quantity = !empty($_GET['show_quantity']);
+  }
+  else {
+    // Set to default
+    $show_quantity = $show_quantity_default;
+  }
+
+  if (empty($context)) {
+    $context = array(
+      'view_mode' => 'display',
+      'class_prefix' => 'cart-line-item-edit-form-' . $line_item->line_item_id
+    );
+  }
+
+  // Render edit form.
+  $form = drupal_get_form('commerce_cart_add_to_cart_form', $line_item, $show_quantity, $context, TRUE);
+
+  return $form;
+}

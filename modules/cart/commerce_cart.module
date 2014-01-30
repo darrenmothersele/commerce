@@ -39,6 +39,25 @@ function commerce_cart_menu() {
     'file' => 'includes/commerce_cart.pages.inc',
   );
 
+  $items['cart/line-items/%commerce_line_item'] = array(
+    'title' => 'Cart Edit',
+    'title callback' => 'commerce_cart_line_item_form_menu_item_title',
+    'title arguments' => array(2),
+    'page callback' => 'commerce_cart_line_item_form_wrapper',
+    'page arguments' => array(2),
+    'access callback' => 'commerce_cart_line_item_form_menu_item_access',
+    'access arguments' => array(2, 'access checkout'),
+    'context' => MENU_CONTEXT_PAGE | MENU_CONTEXT_INLINE,
+    'file' => 'includes/commerce_cart.pages.inc',
+  );
+
+  $items['cart/line-items/%commerce_line_item/edit'] = array(
+    'title' => 'Edit',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => -5,
+    'context' => MENU_CONTEXT_PAGE | MENU_CONTEXT_INLINE,
+  );
+
   return $items;
 }
 
@@ -72,6 +91,59 @@ function commerce_cart_menu_item_title() {
  */
 function commerce_cart_menu_item_redirect() {
   drupal_goto('cart');
+}
+
+ /**
+ * Returns the title of the cart line item form
+ */
+function commerce_cart_line_item_form_menu_item_title($line_item) {
+  $tokens = array(
+    '@title' => 'item',
+    '@label' => '',
+  );
+
+  if ($item_title = commerce_line_item_title($line_item)) {
+    $tokens['@title'] = $item_title;
+  }
+
+  if (!empty($line_item->line_item_label)) {
+    if (!$item_title || strpos($item_title, $line_item->line_item_label) === FALSE) {
+      $tokens['@label'] = ' (' . $line_item->line_item_label . ')';
+    }
+  }
+
+  return t('Edit @title@label', $tokens);
+}
+
+/**
+ * Returns TRUE if access is allowed to the cart line item form
+ */
+function commerce_cart_line_item_form_menu_item_access($line_item, $permission = 'access checkout') {
+  // DENY if the user does not have permission
+  if (!empty($permission) && !user_access($permission)) {
+    return FALSE;
+  }
+
+  // DENY if no order associated with this line item
+  if (empty($line_item->order_id)) {
+    return FALSE;
+  }
+
+  // Load the associated order
+  $order = commerce_order_load($line_item->order_id);
+
+  // DENY if the order does not exist or cannot load
+  if (empty($order)) {
+    return FALSE;
+  }
+
+  // DENY if the order is not a cart
+  if (!commerce_cart_order_is_cart($order)) {
+    return FALSE;
+  }
+
+  // ALLOW if all checks pass
+  return TRUE;
 }
 
 /**
@@ -1147,6 +1219,7 @@ function commerce_cart_product_add($uid, $line_item, $combine = TRUE) {
 
   // If we are supposed to look for a line item to combine into...
   if ($combine) {
+
     // Generate an array of properties and fields to compare.
     $comparison_properties = array('type', 'commerce_product');
 
@@ -1186,6 +1259,9 @@ function commerce_cart_product_add($uid, $line_item, $combine = TRUE) {
       $matching_line_item = $matching_line_item_wrapper->value();
       break;
     }
+
+    $matching_line_item = commerce_cart_matching_product_line_item_in_order($line_item, $order);
+
   }
 
   // If no matching line item was found...
@@ -1266,6 +1342,231 @@ function commerce_cart_product_add_by_id($product_id, $quantity = 1, $combine = 
   }
 
   return FALSE;
+}
+
+ /**
+ * Update an existing line item in the order
+ *
+ * @param $uid
+ *   The uid of the user whose cart you are adding the product to.
+ * @param $line_item
+ *   An existing product line item to be added to the cart with the following data
+ *   on the line item being used to determine how to add the product to the cart:
+ * @param $combine
+ *   Boolean indicating whether or not to combine like products on the same line
+ *   item, incrementing an existing line item's quantity instead of adding a
+ *   new line item to the cart order. When the incoming line item is combined
+ *   into an existing line item, field data on the existing line item will be
+ *   left unchanged. Only the quantity will be incremented and the data array
+ *   will be updated by merging the data from the existing line item onto the
+ *   data from the incoming line item, giving precedence to the most recent data.
+ *
+ * @return
+ *   The new or updated line item object or FALSE on failure.
+ */
+function commerce_cart_line_item_cart_update($uid, $line_item, $combine = TRUE) {
+  // Do not add the line item if it doesn't have a unit price.
+  $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+
+  if (is_null($line_item_wrapper->commerce_unit_price->value())) {
+    return FALSE;
+  }
+
+  // Use line item order if available
+  if (!empty($line_item->order_id)) {
+    $order = commerce_order_load($line_item->order_id);
+  }
+
+  // Attempt to load the customer's shopping cart order.
+  if (empty($order)) {
+    $order = commerce_cart_order_load($uid);
+  }
+
+  // If no order, exit
+  if (empty($order)) {
+    return FALSE;
+  }
+
+  // Wrap the order for easy access to field data.
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  // Extract the product and quantity from the incoming line item.
+  $product = $line_item_wrapper->commerce_product->value();
+  $quantity = $line_item->quantity;
+
+  // Determine if the product already exists on the order and increment its
+  // quantity instead of adding a new line if it does.
+  $matching_line_item = NULL;
+
+  // If we are supposed to look for a line item to combine into...
+  if ($combine) {
+    $matching_line_item = commerce_cart_matching_product_line_item_in_order($line_item, $order);
+  }
+
+  // If no matching line item was found...
+  if (empty($matching_line_item)) {
+    // Save the incoming line item
+    commerce_line_item_save($line_item);
+  }
+  else {
+    // Increment the quantity of the matching line item, update the data array,
+    // and save it.
+    $matching_line_item->quantity += $quantity;
+    $matching_line_item->data = array_merge($line_item->data, $matching_line_item->data);
+
+    commerce_line_item_save($matching_line_item);
+
+    // Clear the line item cache so the updated quantity will be available to
+    // the ensuing load instead of the original quantity as loaded above.
+    entity_get_controller('commerce_line_item')->resetCache(array($matching_line_item->line_item_id));
+
+    // Remove the duplicate incoming line item
+    commerce_line_item_delete($line_item->line_item_id);
+
+    // Update the line item variable for use in the invocation and return value.
+    $line_item = $matching_line_item;
+  }
+
+  // Save the order to update totals, etc.
+  commerce_order_save($order);
+
+  // Invoke the product add event with the newly saved or updated line item.
+  rules_invoke_all('commerce_cart_product_add', $order, $product, $quantity, $line_item);
+
+  // Return the line item.
+  return $line_item;
+}
+
+/**
+ * Returns first matching product line item in the given order that can
+ * be combined with the given line item
+ *
+ * @param $line_item
+ *   Line item object to compare
+ * @param $order
+ *   Order object. If not provided, uses the line item order (if available).
+ *
+ * @return
+ *   Matching line item, else NULL
+ */
+function commerce_cart_matching_product_line_item_in_order($line_item, $order = NULL) {
+  // Resolve order
+  if (empty($order)) {
+    // Use line item order if available
+    if (!empty($line_item->order_id)) {
+      $order = commerce_order_load($line_item->order_id);
+    }
+
+    // Exit if no order found
+    if (empty($order)) {
+      return FALSE;
+    }
+  }
+
+  // Wrap the order for easy access to field data.
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  // Loop over each line item on the order.
+  foreach ($order_wrapper->commerce_line_items as $delta => $matching_line_item_wrapper) {
+    $matching_line_item = $matching_line_item_wrapper->value();
+
+    // If every comparison line item matched, combine into this line item ...
+    if (commerce_cart_product_line_item_can_combine($line_item, $matching_line_item)) {
+      return $matching_line_item;
+    }
+  }
+}
+
+/**
+ * Returns TRUE if the product line items can be combined
+ *
+ * @param $a
+ *   Line item object
+ * @param $b
+ *   Line item object
+ *
+ * @return
+ *   TRUE if the line items can be combined
+ */
+function commerce_cart_product_line_item_can_combine($a, $b) {
+  // Exclude self
+  if (!empty($a->line_item_id) && !empty($b->line_item_id) && $a->line_item_id == $b->line_item_id) {
+    return FALSE;
+  }
+
+  return commerce_cart_product_line_item_match($a, $b);
+}
+
+/**
+ * Returns TRUE if the product line items have equivalent comparison properties
+ *
+ * @param $a
+ *   Line item object
+ * @param $b
+ *   Line item object
+ *
+ * @return
+ *   TRUE if the line items are similar
+ */
+function commerce_cart_product_line_item_match($a, $b) {
+  // Use the first line item's type to resolve the properties
+  $comparison_properties = commerce_cart_product_comparison_properties($a->type);
+  if (empty($comparison_properties)) {
+    return FALSE;
+  }
+
+  // Wrap the lines to compare
+  $a_wrapper = entity_metadata_wrapper('commerce_line_item', $a);
+  $b_wrapper = entity_metadata_wrapper('commerce_line_item', $b);
+
+  // Examine each of the comparison properties on the line item.
+  foreach ($comparison_properties as $property) {
+    // If any property does not match the same property on the other line item ...
+    if ($a_wrapper->{$property}->raw() != $b_wrapper->{$property}->raw()) {
+      return FALSE;
+    }
+  }
+
+  // If every comparison property matched ...
+  return TRUE;
+}
+
+/**
+ * Returns an array of comparison properties used to determine whether
+ * or not a product line item can be combined into an existing line
+ * item when added to the cart.
+ *
+ * @param $comparison_properties
+ *   The array of property names (including field names) that map to properties
+ *   on the line item wrappers being compared to check for combination.
+ */
+function commerce_cart_product_comparison_properties($line_item_type) {
+  $props = &drupal_static(__FUNCTION__, array());
+
+  if (!isset($props[$line_item_type])) {
+    $props[$line_item_type] = array();
+
+    // Generate an array of properties and fields to compare.
+    $comparison_properties = array('type', 'commerce_product');
+
+    // Add any field that was exposed on the Add to Cart form to the array.
+    // TODO: Bypass combination when an exposed field is no longer available but
+    // the same base product is added to the cart.
+    foreach (field_info_instances('commerce_line_item', $line_item_type) as $info) {
+      if (!empty($info['commerce_cart_settings']['field_access'])) {
+        $comparison_properties[] = $info['field_name'];
+      }
+    }
+
+    // Allow other modules to specify what properties should be compared when
+    // determining whether or not to combine line items.
+    drupal_alter('commerce_cart_product_comparison_properties', $comparison_properties);
+
+    // Update cache
+    $props[$line_item_type] = $comparison_properties;
+  }
+
+  return $props[$line_item_type];
 }
 
 /**
@@ -1562,7 +1863,7 @@ function commerce_cart_forms($form_id, $args) {
  * @return
  *   The form array.
  */
-function commerce_cart_add_to_cart_form($form, &$form_state, $line_item, $show_quantity = FALSE, $context = array()) {
+function commerce_cart_add_to_cart_form($form, &$form_state, $line_item, $show_quantity = FALSE, $context = array(), $show_price = FALSE) {
   global $user;
 
   // Store the context in the form state for use during AJAX refreshes.
@@ -1632,7 +1933,8 @@ function commerce_cart_add_to_cart_form($form, &$form_state, $line_item, $show_q
     // product Add to Cart form is disabled in the form context, store the
     // product_id in a hidden form field for use by the submit handler.
     if (count($products) == 1 && empty($line_item->data['context']['show_single_product_attributes'])) {
-      $form_state['default_product'] = reset($products);
+      $default_product = reset($products);
+      $form_state['default_product'] = $default_product;
 
       $form['product_id'] = array(
         '#type' => 'hidden',
@@ -2022,6 +2324,14 @@ function commerce_cart_add_to_cart_form($form, &$form_state, $line_item, $show_q
       );
     }
 
+    // Render price field display if necessary
+    if ($show_price) {
+      // Add price display
+      $form['price'] = field_view_field('commerce_product', $default_product, 'commerce_price', $context['view_mode']);
+      $form['price']['#prefix'] = '<div ' . drupal_attributes(array('class' => array('cart-line-item-edit-form-' . $line_item->line_item_id . '-product-commerce-price'))) . '>';
+      $form['price']['#suffix'] = '</div>';
+    }
+
     // Add the line item's fields to a container on the form.
     $form['line_item_fields'] = array(
       '#type' => 'container',
@@ -2054,6 +2364,13 @@ function commerce_cart_add_to_cart_form($form, &$form_state, $line_item, $show_q
         // Do not set #disabled in order not to prevent submission.
         '#attributes' => array('disabled' => 'disabled'),
         '#validate' => array('commerce_cart_add_to_cart_form_disabled_validate'),
+      );
+    }
+    elseif (!empty($line_item->line_item_id)) {
+      $form['submit'] = array(
+        '#type' => 'submit',
+        '#value' => t('Update'),
+        '#weight' => 50,
       );
     }
     else {
@@ -2205,44 +2522,54 @@ function commerce_cart_add_to_cart_form_attributes_refresh($form, $form_state) {
 function commerce_cart_add_to_cart_form_submit($form, &$form_state) {
   $product_id = $form_state['values']['product_id'];
   $product = commerce_product_load($product_id);
+  $line_item_is_new = empty($form_state['line_item']->line_item_id);
 
   // If the line item passed to the function is new...
-  if (empty($form_state['line_item']->line_item_id)) {
+  if ($line_item_is_new) {
     // Create the new product line item of the same type.
     $line_item = commerce_product_line_item_new($product, $form_state['values']['quantity'], 0, $form_state['line_item']->data, $form_state['line_item']->type);
+  }
+  else {
+    // Update the existing line item
+    $line_item = $form_state['line_item'];
+    $line_item->quantity = $form_state['values']['quantity'];
+    commerce_product_line_item_populate($line_item, $product);
+  }
 
-    // Allow modules to prepare this as necessary. This hook is defined by the
-    // Product Pricing module.
-    drupal_alter('commerce_product_calculate_sell_price_line_item', $line_item);
+  // Allow modules to prepare this as necessary. This hook is defined by the
+  // Product Pricing module.
+  drupal_alter('commerce_product_calculate_sell_price_line_item', $line_item);
 
-    // Remove line item field values the user didn't have access to modify.
-    foreach ($form_state['values']['line_item_fields'] as $field_name => $value) {
-      // Note that we're checking the Commerce Cart settings that we inserted
-      // into this form element array back when we built the form. This means a
-      // module wanting to alter a line item field widget to be available must
-      // update both its form element's #access value and the field_access value
-      // of the #commerce_cart_settings array.
-      if (empty($form['line_item_fields'][$field_name]['#commerce_cart_settings']['field_access'])) {
-        unset($form_state['values']['line_item_fields'][$field_name]);
-      }
-    }
+  // Remove line item field values the user didn't have access to modify.
+  foreach ($form_state['values']['line_item_fields'] as $field_name => $value) {
+    // Note that we're checking the Commerce Cart settings that we inserted
+    // into this form element array back when we built the form. This means a
+    // module wanting to alter a line item field widget to be available must
+    // update both its form element's #access value and the field_access value
+    // of the #commerce_cart_settings array.
+    if (empty($form['line_item_fields'][$field_name]['#commerce_cart_settings']['field_access'])) {
+      unset($form_state['values']['line_item_fields'][$field_name]);
+     }
+  }
 
-    // Unset the line item field values array if it is now empty.
-    if (empty($form_state['values']['line_item_fields'])) {
-      unset($form_state['values']['line_item_fields']);
-    }
+  // Unset the line item field values array if it is now empty.
+  if (empty($form_state['values']['line_item_fields'])) {
+    unset($form_state['values']['line_item_fields']);
+  }
 
-    // Add field data to the line item.
-    field_attach_submit('commerce_line_item', $line_item, $form['line_item_fields'], $form_state);
+  // Add field data to the line item.
+  field_attach_submit('commerce_line_item', $line_item, $form['line_item_fields'], $form_state);
 
-    // Process the unit price through Rules so it reflects the user's actual
-    // purchase price.
-    rules_invoke_event('commerce_product_calculate_sell_price', $line_item);
+  // Process the unit price through Rules so it reflects the user's actual
+  // purchase price.
+  rules_invoke_event('commerce_product_calculate_sell_price', $line_item);
 
-    // Only attempt an Add to Cart if the line item has a valid unit price.
-    $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+  // Wrap the line item.
+  $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
 
-    if (!is_null($line_item_wrapper->commerce_unit_price->value())) {
+  // Only attempt an Add to Cart if the line item has a valid unit price.
+  if (!is_null($line_item_wrapper->commerce_unit_price->value())) {
+    if ($line_item_is_new) {
       // Add the product to the specified shopping cart.
       $form_state['line_item'] = commerce_cart_product_add(
         $form_state['values']['uid'],
@@ -2251,9 +2578,22 @@ function commerce_cart_add_to_cart_form_submit($form, &$form_state) {
       );
     }
     else {
-      drupal_set_message(t('%title could not be added to your cart.', array('%title' => $product->title)), 'error');
+      // Update existing line item
+      $form_state['line_item'] = commerce_cart_line_item_cart_update(
+        $form_state['values']['uid'],
+        $line_item,
+        isset($line_item->data['context']['add_to_cart_combine']) ? $line_item->data['context']['add_to_cart_combine'] : TRUE
+      );
     }
   }
+
+  else {
+    drupal_set_message(t('%title could not be added to your cart.', array('%title' => $product->title)), 'error');
+  }
+
+  // Ensure that page redirects back to its original URL without losing query parameters, such as pagers.
+  // @todo Remove when http://drupal.org/node/171267 is fixed.
+  $form_state['redirect'] = array(current_path(), array('query' => drupal_get_query_parameters()));
 }
 
 /**
